@@ -1,182 +1,172 @@
+import warnings
+
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
-from scipy.signal import find_peaks
+
+from utils.img_utils import align_outputs, get_peaks, preprocess, reproject, sample_ring_gaps, save_img, truncate_edge
+from utils.optimizer import refine_center
 
 
-def createLineIterator(P1, P2, img):
-    """
-    Produces and array that consists of the coordinates and intensities of each pixel in a line between two points
+def solve_lock_dfs(rings, picks, lock_index, used_picks=[]):
+    """Perform a depth-first search to solve the lock."""
 
-    Parameters:
-        -P1: a numpy array that consists of the coordinate of the first point (x,y)
-        -P2: a numpy array that consists of the coordinate of the second point (x,y)
-        -img: the image being processed
+    solve_str = ""
 
-    Returns:
-        -it: a numpy array that consists of the coordinates and intensities of each pixel in the radii (shape: [numPixels, 3], row = [x,y,intensity])
-    """
-    # define local variables for readability
-    imageH = img.shape[0]
-    imageW = img.shape[1]
-    P1X = P1[0]
-    P1Y = P1[1]
-    P2X = P2[0]
-    P2Y = P2[1]
+    if lock_index == len(rings):
+        return " - SOLVED"
 
-    # difference and absolute difference between points
-    # used to calculate slope and relative location between points
-    dX = P2X - P1X
-    dY = P2Y - P1Y
-    dXa = np.abs(dX)
-    dYa = np.abs(dY)
+    if np.all(rings[lock_index]):
+        # we've solved this one, move on
+        solve_return = solve_lock_dfs(rings, picks, lock_index + 1, used_picks)
+        if solve_return:
+            return solve_str + solve_return
+    elif len(used_picks) == len(picks):
+        return "No picks left."
 
-    # predefine numpy array for output based on distance between points
-    itbuffer = np.empty(shape=(np.maximum(dYa, dXa), 3), dtype=np.float32)
-    itbuffer.fill(np.nan)
+    # check to see if any picks left have the correct number of points remaining
+    valid = False
+    for i, pick in enumerate(picks):
+        if len(np.argwhere(pick == True)) <= len(np.argwhere(rings[lock_index] == False)):
+            valid = True
+    if not valid:
+        return "No picks left."
 
-    # Obtain coordinates along the line using a form of Bresenham's algorithm
-    negY = P1Y > P2Y
-    negX = P1X > P2X
-    if P1X == P2X:  # vertical line segment
-        itbuffer[:, 0] = P1X
-        if negY:
-            itbuffer[:, 1] = np.arange(P1Y - 1, P1Y - dYa - 1, -1)
-        else:
-            itbuffer[:, 1] = np.arange(P1Y + 1, P1Y + dYa + 1)
-    elif P1Y == P2Y:  # horizontal line segment
-        itbuffer[:, 1] = P1Y
-        if negX:
-            itbuffer[:, 0] = np.arange(P1X - 1, P1X - dXa - 1, -1)
-        else:
-            itbuffer[:, 0] = np.arange(P1X + 1, P1X + dXa + 1)
-    else:  # diagonal line segment
-        steepSlope = dYa > dXa
-        if steepSlope:
-            slope = dX.astype(np.float32) / dY.astype(np.float32)
-            if negY:
-                itbuffer[:, 1] = np.arange(P1Y - 1, P1Y - dYa - 1, -1)
-            else:
-                itbuffer[:, 1] = np.arange(P1Y + 1, P1Y + dYa + 1)
-            itbuffer[:, 0] = (slope * (itbuffer[:, 1] - P1Y)).astype(int) + P1X
-        else:
-            slope = dY.astype(np.float32) / dX.astype(np.float32)
-            if negX:
-                itbuffer[:, 0] = np.arange(P1X - 1, P1X - dXa - 1, -1)
-            else:
-                itbuffer[:, 0] = np.arange(P1X + 1, P1X + dXa + 1)
-            itbuffer[:, 1] = (slope * (itbuffer[:, 0] - P1X)).astype(int) + P1Y
+    for pick_num, pick in enumerate(picks):
+        if pick_num in used_picks:
+            continue
+        for angle in range(0, 32):
+            # roll the pick and insert it into the ring
+            rolled_pick = np.roll(pick, angle)
+            insert = rings[lock_index][np.argwhere(rolled_pick == True)]
 
-    # Remove points outside of image
-    colX = itbuffer[:, 0]
-    colY = itbuffer[:, 1]
-    itbuffer = itbuffer[(colX >= 0) & (colY >= 0) & (colX < imageW) & (colY < imageH)]
+            # no match
+            if np.any(insert):
+                continue
 
-    # Get intensities from img ndarray
-    itbuffer[:, 2] = img[itbuffer[:, 1].astype(np.uint), itbuffer[:, 0].astype(np.uint)]
+            # make a copy of the remaining rings
+            remaining_rings = rings.copy()
+            # fill the ring with the pick
+            remaining_rings[lock_index] = remaining_rings[lock_index] + rolled_pick
+            used_picks_copy = [x for x in used_picks]
+            used_picks_copy.append(pick_num)
 
-    return itbuffer
+            solve_ret = solve_lock_dfs(remaining_rings, picks, lock_index, used_picks_copy)
+            if solve_ret:
+                if angle > 16:
+                    angle = angle - 32
+                return solve_str + f"{pick_num}[{angle}]" + solve_ret
+
+    return solve_str + f"{pick_num}[{angle}]"
 
 
-base_img = cv2.imread("lock2.png", cv2.IMREAD_COLOR)
-img = base_img.copy()
-
-# get the dimensions of the image
-height, width, colors = img.shape
-
-cv2.imwrite("lock_cropped.jpg", img)
-
-img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-
-ret, img = cv2.threshold(img, 30, 255, cv2.THRESH_BINARY)
-cv2.imwrite("lock_threshold.jpg", img)
-
-img = cv2.blur(img, (4, 4))
-cv2.imwrite("lock_blur.jpg", img)
-
-detected_circles: list = cv2.HoughCircles(
-    img, cv2.HOUGH_GRADIENT, 1, height, param1=100, param2=30, minRadius=100, maxRadius=width
-)
+def main():
+    IMG_PATH = "./test_imgs/rl.png"
 
 
-if detected_circles is not None:
-    # Convert the circle parameters a, b and r to integers.
-    detected_circles = np.uint16(np.around(detected_circles))
+    base_img = cv2.imread(IMG_PATH, cv2.IMREAD_COLOR)
+    img = base_img.copy()
 
-    for pt in detected_circles[0, :]:
-        a, b, r = pt[0], pt[1], pt[2]
+    # get the dimensions of the image
+    height, width, colors = img.shape
 
-        # Draw the circumference of the circle.
-        cv2.circle(base_img, (a, b), r, (0, 255, 0), 2)
+    bw_img, thresh_img, blur_img, detected_circles = preprocess(img, height, width)
 
-        # Draw a small circle (of radius 1) to show the center.
-        cv2.circle(base_img, (a, b), 1, (0, 0, 255), 3)
-        cv2.imwrite("lock_circles.jpg", base_img)
+    outer_lock_circle = detected_circles[0]
+    center_x, center_y, lock_radius = outer_lock_circle[0][0], outer_lock_circle[0][1], outer_lock_circle[0][2]
 
-outer_lock_circle = detected_circles[0]
-center_x, center_y, lock_radius = outer_lock_circle[0][0], outer_lock_circle[0][1], outer_lock_circle[0][2]
+    # (center_x, center_y), lock_radius = refine_center(center_x, center_y, lock_radius, thresh_img)
 
-ray_vals = []
-
-for i in range(32):
-    # draw 32 lines around the center
-    angle = i * 11.25
-    rad = np.deg2rad(angle)
-    end_x = int(center_x + lock_radius * np.cos(rad))
-    end_y = int(center_y + lock_radius * np.sin(rad))
-
-    # extract the values of the pixels under the line
-    line_iter = createLineIterator((center_x, center_y), (end_x, end_y), img)
-    ray_vals.append(line_iter[:, 2])
-
-    # draw the line
-    cv2.line(base_img, (center_x, center_y), (end_x, end_y), (255, 255, 255, 255), 2)
-    # label the line
-    cv2.putText(
+    reprojected_img = reproject(
+        thresh_img,
+        center_x,
+        center_y,
+        lock_radius,
+        32,
         base_img,
-        str(i),
-        (int(end_x * 1.01), int(end_y * 1.01)),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.5,
-        (255, 0, 0),
-        1,
-        cv2.LINE_AA,
     )
 
-    cv2.imwrite("lock_lines.jpg", base_img)
+    # trunc_img = truncate_edge(reprojected_img)
+    aligned_img, line_averages = align_outputs(reprojected_img)
+    ring_peaks = get_peaks(line_averages)
+    peak_samples = sample_ring_gaps(aligned_img, ring_peaks)
 
-# for each ray, find the peaks
-peaks = []
-for ray in ray_vals:
-    ray_peaks, _ = find_peaks(ray, height=250)
-    # limit to the first 4 peaks
-    peaks.append(ray_peaks[:4])
+    # convert peak samples to a boolean array
+    lock_bools = np.array(peak_samples) > 0
+
+    # look for the picks in the image
+    pick_max_radius = int(0.15 * lock_radius)
+    pick_min_radius = int(0.09 * lock_radius)
+
+    bw_img = cv2.cvtColor(base_img, cv2.COLOR_BGR2GRAY)
+    _, thresh_img = cv2.threshold(bw_img, 20, 255, cv2.THRESH_BINARY)
+    blur_img = cv2.blur(thresh_img, (2, 2))
+    cv2.imwrite("blur.bmp", blur_img)
+    pick_circles: list = cv2.HoughCircles(
+        blur_img,
+        cv2.HOUGH_GRADIENT,
+        1,
+        pick_max_radius,
+        param1=100,
+        param2=30,
+        minRadius=pick_min_radius,
+        maxRadius=pick_max_radius,
+    )
+
+    pick_circles = np.uint16(np.around(pick_circles))
+
+    pick_vals = []
+
+    for pick_num, pt in enumerate(pick_circles[0, :]):
+        a, b, r = pt[0], pt[1], pt[2]
+
+        cv2.circle(base_img, (a, b), 1, (0, 0, 255), 3)
+        cv2.circle(base_img, (a, b), r, (0, 255, 0), 2)
+        # label the pick
+        cv2.putText(base_img, f"{pick_num}", (a + 5, b + 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+        cv2.imwrite("pick_circles.bmp", base_img)
+
+        num_rays = 32
+
+        new_img = []
+        r_vals = np.full(num_rays, 255)
+
+        while np.count_nonzero(r_vals) > 4:
+            for i in range(num_rays):
+                theta = i * (360 / num_rays)
+                rad = np.deg2rad(theta)
+
+                x = int(a + r * np.cos(rad))
+                y = int(b + r * np.sin(rad))
+
+                # Draw the sample dots for debugging.
+                # if DEBUG:
+                # dot_update = cv2.circle(sample_copy, (x, y), 1, (0, 255, 0), 2)
+
+                r_vals[i] = thresh_img[y, x]
+            r -= 1
+
+        if np.count_nonzero(r_vals) > 0:
+            new_img = np.array(r_vals)
+            pick_vals.append(new_img)
+            # cv2.circle(base_img, (a, b), r, (0, 255, 0), 2)
+            # save_img(new_img, f"reprojected_{pick_num}_img.bmp")
+        else:
+            warnings.warn(f"Pick {pick_num} doesn't have any points.")
+
+    pick_bools = np.array(pick_vals) > 0
+
+    lock_bools = lock_bools.transpose()
+
+    all_rings = lock_bools
+    all_picks = pick_bools
+
+    for pick in all_picks:
+        print(np.count_nonzero(pick))
+
+    print(solve_lock_dfs(all_rings, all_picks, 0))
 
 
-def draw_peak_locations(img, peaks):
-    for i, ray in enumerate(peaks):
-        angle = i * 11.25
-        rad = np.deg2rad(angle)
-        for peak in ray:
-            end_x = int(center_x + peak * np.cos(rad))
-            end_y = int(center_y + peak * np.sin(rad))
-
-            cv2.circle(img, (end_x, end_y), 3, (0, 0, 255), 2)
-
-            cv2.putText(
-                img,
-                str(peak),
-                (int(end_x * 1.01), int(end_y * 1.01)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
-                (255, 0, 0),
-                1,
-                cv2.LINE_AA,
-            )
-
-    cv2.imwrite("lock_peaks.jpg", img)
-
-
-draw_peak_locations(base_img, peaks)
-
-print(peaks)
+if __name__ == "__main__":
+    main()
